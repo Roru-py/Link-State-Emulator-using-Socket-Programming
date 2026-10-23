@@ -1,0 +1,4 @@
+# 2-node network: A-B, fully connected
+# Cost from A to B
+5
+

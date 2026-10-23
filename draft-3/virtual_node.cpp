@@ -1,328 +1,375 @@
-#include <arpa/inet.h>
-#include <cstring>
 #include <iostream>
-#include <string>
 #include <vector>
+#include <string>
+#include <cstring>
 #include <ctime>
-#include <sys/select.h>
-#include <sys/socket.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <sys/select.h>
 
-#define ON_PORT 5000
-#define MAX_NODES 26
-#define INF_COST 1000000000
+using namespace std;
+
+const int MAX_NODES = 26;
+const int INF = 1000000000;
 
 #pragma pack(push, 1)
 struct ConnectMsg {
-  uint32_t ip;
-  uint16_t port;
+    uint32_t ip;
+    uint16_t port;
 };
+
 struct LSTuple {
-  char node;
-  uint32_t ip;
-  uint16_t port;
-  int32_t cost;
+    char node;
+    uint32_t ip;
+    uint16_t port;
+    int32_t cost;
 };
+
 struct LSPHeader {
-  char origin;
-  uint32_t seq;
-  uint8_t num_links;
+    char origin;
+    uint32_t seq;
+    uint8_t numLinks;
 };
+
 struct LSPLink {
-  char neighbor;
-  int32_t cost;
+    char neighbor;
+    int32_t cost;
 };
 #pragma pack(pop)
 
 struct Neighbor {
-  char node;
-  uint32_t ip;
-  uint16_t port;
-  int cost;
+    char node;
+    uint32_t ip;
+    uint16_t port;
+    int cost;
 };
 
-void sendLSP(int udpSock, char myNode, uint32_t mySeq, const std::vector<Neighbor> &neighbors, uint32_t excludeIP = 0, uint16_t excludePort = 0) {
-  std::vector<uint8_t> packet(sizeof(LSPHeader) + neighbors.size() * sizeof(LSPLink));
-  LSPHeader *hdr = (LSPHeader *)packet.data();
-  hdr->origin = myNode;
-  hdr->seq = htonl(mySeq);
-  hdr->num_links = (uint8_t)neighbors.size();
+char my_node = 0;
+uint32_t my_seq = 0;
+vector<Neighbor> neighbors;
+int graph[MAX_NODES][MAX_NODES];
+bool known[MAX_NODES];
+uint32_t max_seq[MAX_NODES];
 
-  LSPLink *links = (LSPLink *)(packet.data() + sizeof(LSPHeader));
-  for (size_t i = 0; i < neighbors.size(); ++i) {
-    links[i].neighbor = neighbors[i].node;
-    links[i].cost = htonl(neighbors[i].cost);
-  }
-
-  for (const auto &nbr : neighbors) {
-    if (excludeIP != 0 && nbr.ip == excludeIP && nbr.port == excludePort) {
-      continue;
+bool recv_all(int fd, void *buf, size_t total) {
+    char *ptr = (char *)buf;
+    size_t received = 0;
+    while (received < total) {
+        ssize_t n = recv(fd, ptr + received, total - received, 0);
+        if (n <= 0) return false;
+        received += n;
     }
-    sockaddr_in destAddr{};
-    destAddr.sin_family = AF_INET;
-    destAddr.sin_addr.s_addr = nbr.ip;
-    destAddr.sin_port = htons(nbr.port);
-    sendto(udpSock, packet.data(), packet.size(), 0, (sockaddr *)&destAddr, sizeof(destAddr));
-    sendto(udpSock, packet.data(), packet.size(), 0, (sockaddr *)&destAddr, sizeof(destAddr));
-  }
+    return true;
 }
 
-void forwardLSP(int udpSock, const uint8_t *packet, size_t packetLen, const std::vector<Neighbor> &neighbors, uint32_t fromIP, uint16_t fromPort) {
-  for (const auto &nbr : neighbors) {
-    if (nbr.ip == fromIP && nbr.port == fromPort) {
-      continue;
+bool send_all(int fd, const void *buf, size_t total) {
+    const char *ptr = (const char *)buf;
+    size_t sent = 0;
+    while (sent < total) {
+        ssize_t n = send(fd, ptr + sent, total - sent, 0);
+        if (n <= 0) return false;
+        sent += n;
     }
-    sockaddr_in destAddr{};
-    destAddr.sin_family = AF_INET;
-    destAddr.sin_addr.s_addr = nbr.ip;
-    destAddr.sin_port = htons(nbr.port);
-    sendto(udpSock, packet, packetLen, 0, (sockaddr *)&destAddr, sizeof(destAddr));
-    sendto(udpSock, packet, packetLen, 0, (sockaddr *)&destAddr, sizeof(destAddr));
-  }
+    return true;
 }
 
-void runDijkstra(char myNode, int graph[MAX_NODES][MAX_NODES], const bool knownNodes[MAX_NODES]) {
-  int src = myNode - 'A';
-  int dist[MAX_NODES];
-  bool visited[MAX_NODES];
-
-  for (int i = 0; i < MAX_NODES; ++i) {
-    dist[i] = INF_COST;
-    visited[i] = false;
-  }
-  dist[src] = 0;
-
-  for (int count = 0; count < MAX_NODES; ++count) {
-    int u = -1;
-    int min_d = INF_COST;
-    for (int i = 0; i < MAX_NODES; ++i) {
-      if (knownNodes[i] && !visited[i] && dist[i] < min_d) {
-        min_d = dist[i];
-        u = i;
-      }
-    }
-    if (u == -1) break;
-    visited[u] = true;
-
-    for (int v = 0; v < MAX_NODES; ++v) {
-      if (knownNodes[v] && !visited[v] && graph[u][v] > 0) {
-        if (dist[u] + graph[u][v] < dist[v]) {
-          dist[v] = dist[u] + graph[u][v];
+void flood_lsp(int udp_sock, const uint8_t *packet, size_t len, uint32_t skip_ip = 0, uint16_t skip_port = 0) {
+    for (size_t i = 0; i < neighbors.size(); i++) {
+        if (neighbors[i].ip == skip_ip && neighbors[i].port == skip_port) {
+            continue;
         }
-      }
-    }
-  }
 
-  std::string dijkstraOut = "";
-  for (int i = 0; i < MAX_NODES; ++i) {
-    if (knownNodes[i] && i != src) {
-      char target = (char)('A' + i);
-      dijkstraOut += std::string(1, target) + "=" + (dist[i] == INF_COST ? "INF" : std::to_string(dist[i])) + ", ";
+        sockaddr_in dest_addr{};
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_addr.s_addr = neighbors[i].ip;
+        dest_addr.sin_port = htons(neighbors[i].port);
+
+        sendto(udp_sock, packet, len, 0, (sockaddr *)&dest_addr, sizeof(dest_addr));
+        sendto(udp_sock, packet, len, 0, (sockaddr *)&dest_addr, sizeof(dest_addr));
     }
-  }
-  if (dijkstraOut.length() > 2) dijkstraOut.erase(dijkstraOut.length() - 2);
-  std::cout << "Shortest Paths from " << myNode << ": " << dijkstraOut << std::endl;
 }
 
-void printGraph(char myNode, int graph[MAX_NODES][MAX_NODES], const bool knownNodes[MAX_NODES]) {
-  std::vector<char> nodes;
-  for (int i = 0; i < MAX_NODES; ++i) {
-    if (knownNodes[i]) nodes.push_back((char)('A' + i));
-  }
-  if (nodes.size() <= 1) return;
+void send_own_lsp(int udp_sock) {
+    my_seq++;
+    max_seq[my_node - 'A'] = my_seq;
 
-  std::cout << "\n--- Known Graph (Node " << myNode << ") ---" << std::endl;
-  for (size_t i = 0; i < nodes.size() - 1; ++i) {
-    for (size_t t = 0; t < i; ++t) std::cout << "\t";
-    for (size_t j = i + 1; j < nodes.size(); ++j) {
-      int u = nodes[i] - 'A';
-      int v = nodes[j] - 'A';
-      int cost = -1;
-      if (graph[u][v] != -1) cost = graph[u][v];
-      else if (graph[v][u] != -1) cost = graph[v][u];
-      std::cout << cost;
-      if (j + 1 < nodes.size()) std::cout << "\t";
+    size_t packet_size = sizeof(LSPHeader) + neighbors.size() * sizeof(LSPLink);
+    vector<uint8_t> buffer(packet_size);
+
+    LSPHeader *hdr = (LSPHeader *)buffer.data();
+    hdr->origin = my_node;
+    hdr->seq = htonl(my_seq);
+    hdr->numLinks = (uint8_t)neighbors.size();
+
+    LSPLink *link_data = (LSPLink *)(buffer.data() + sizeof(LSPHeader));
+    for (size_t i = 0; i < neighbors.size(); i++) {
+        link_data[i].neighbor = neighbors[i].node;
+        link_data[i].cost = htonl(neighbors[i].cost);
     }
-    std::cout << std::endl;
-  }
-  runDijkstra(myNode, graph, knownNodes);
+
+    flood_lsp(udp_sock, buffer.data(), buffer.size());
+}
+
+void run_dijkstra() {
+    int src = my_node - 'A';
+    int dist[MAX_NODES];
+    bool visited[MAX_NODES];
+
+    for (int i = 0; i < MAX_NODES; i++) {
+        dist[i] = INF;
+        visited[i] = false;
+    }
+    dist[src] = 0;
+
+    for (int step = 0; step < MAX_NODES; step++) {
+        int u = -1;
+        int min_val = INF;
+        for (int i = 0; i < MAX_NODES; i++) {
+            if (known[i] && !visited[i] && dist[i] < min_val) {
+                min_val = dist[i];
+                u = i;
+            }
+        }
+        if (u == -1) break;
+        visited[u] = true;
+
+        for (int v = 0; v < MAX_NODES; v++) {
+            if (known[v] && !visited[v] && graph[u][v] > 0) {
+                if (dist[u] + graph[u][v] < dist[v]) {
+                    dist[v] = dist[u] + graph[u][v];
+                }
+            }
+        }
+    }
+
+    string res = "";
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (known[i] && i != src) {
+            char target = (char)('A' + i);
+            res += string(1, target) + "=" + (dist[i] == INF ? "INF" : to_string(dist[i])) + ", ";
+        }
+    }
+    if (res.size() > 2) res.erase(res.size() - 2);
+    cout << "Shortest Paths from " << my_node << ": " << res << endl;
+}
+
+void print_adj_list() {
+    vector<int> node_indices;
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (known[i]) {
+            node_indices.push_back(i);
+        }
+    }
+    if (node_indices.size() <= 1) return;
+
+    cout << "\n--- Known Graph (Node " << my_node << ") ---" << endl;
+    for (size_t i = 0; i < node_indices.size(); i++) {
+        int u = node_indices[i];
+        cout << (char)('A' + u) << ": ";
+        bool first = true;
+        for (size_t j = 0; j < node_indices.size(); j++) {
+            int v = node_indices[j];
+            if (u != v && graph[u][v] > 0) {
+                if (!first) cout << ", ";
+                cout << (char)('A' + v) << "=" << graph[u][v];
+                first = false;
+            }
+        }
+        cout << endl;
+    }
+    run_dijkstra();
+}
+
+bool handle_link_state(int tcp_sock, int udp_sock) {
+    uint8_t count = 0;
+    if (!recv_all(tcp_sock, &count, 1)) {
+        cout << "\nOracle Node disconnected." << endl;
+        return false;
+    }
+
+    vector<LSTuple> tuples(count);
+    if (!recv_all(tcp_sock, tuples.data(), count * sizeof(LSTuple))) {
+        cout << "\nIncomplete LINK-STATE message from Oracle Node." << endl;
+        return false;
+    }
+
+    neighbors.clear();
+    if (my_node != 0) {
+        cout << "\nConfig change received at Node " << my_node << "!" << endl;
+        int me = my_node - 'A';
+        for (int i = 0; i < MAX_NODES; i++) {
+            graph[me][i] = (i == me ? 0 : -1);
+            graph[i][me] = (i == me ? 0 : -1);
+        }
+    }
+
+    string out = "";
+    for (size_t i = 0; i < tuples.size(); i++) {
+        int cost = ntohl(tuples[i].cost);
+        if (cost == 0) {
+            my_node = tuples[i].node;
+            known[my_node - 'A'] = true;
+            out = string(1, tuples[i].node) + "=0, " + out;
+        } else {
+            neighbors.push_back({tuples[i].node, tuples[i].ip, ntohs(tuples[i].port), cost});
+            known[tuples[i].node - 'A'] = true;
+            graph[my_node - 'A'][tuples[i].node - 'A'] = cost;
+            graph[tuples[i].node - 'A'][my_node - 'A'] = cost;
+            out += string(1, tuples[i].node) + "=" + to_string(cost) + ", ";
+        }
+    }
+
+    if (out.size() > 2) out.erase(out.size() - 2);
+    cout << "Received " << out << endl;
+
+    if (my_node != 0) {
+        send_own_lsp(udp_sock);
+    }
+    return true;
+}
+
+void handle_incoming_lsp(int udp_sock) {
+    uint8_t buf[2048];
+    sockaddr_in sender_addr{};
+    socklen_t addr_len = sizeof(sender_addr);
+
+    int bytes = recvfrom(udp_sock, buf, sizeof(buf), 0, (sockaddr *)&sender_addr, &addr_len);
+    if (bytes < (int)sizeof(LSPHeader)) return;
+
+    LSPHeader *hdr = (LSPHeader *)buf;
+    char origin = hdr->origin;
+    int origin_idx = origin - 'A';
+    uint32_t seq = ntohl(hdr->seq);
+    int num_links = hdr->numLinks;
+
+    if (bytes < (int)(sizeof(LSPHeader) + num_links * sizeof(LSPLink))) return;
+    if (origin == my_node || origin_idx < 0 || origin_idx >= MAX_NODES) return;
+    if (seq <= max_seq[origin_idx]) return;
+
+    max_seq[origin_idx] = seq;
+    known[origin_idx] = true;
+
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (i != origin_idx) {
+            graph[origin_idx][i] = -1;
+            graph[i][origin_idx] = -1;
+        }
+    }
+
+    LSPLink *link_arr = (LSPLink *)(buf + sizeof(LSPHeader));
+    for (int i = 0; i < num_links; i++) {
+        int nb_idx = link_arr[i].neighbor - 'A';
+        int cost = ntohl(link_arr[i].cost);
+        if (nb_idx >= 0 && nb_idx < MAX_NODES) {
+            known[nb_idx] = true;
+            graph[origin_idx][nb_idx] = cost;
+            graph[nb_idx][origin_idx] = cost;
+        }
+    }
+
+    flood_lsp(udp_sock, buf, bytes, sender_addr.sin_addr.s_addr, ntohs(sender_addr.sin_port));
 }
 
 int main(int argc, char *argv[]) {
-  if (argc != 4) {
-    std::cerr << "Usage: " << argv[0]
-              << " <ON_IP_ADDRESS> <VN_IP_ADDRESS> <VN_UDP_PORT>\n";
-    return 1;
-  }
-
-  uint32_t vnIP = inet_addr(argv[2]);
-  uint16_t vnPort = (uint16_t)std::stoi(argv[3]);
-
-  int udpSock = socket(AF_INET, SOCK_DGRAM, 0);
-  if (udpSock < 0) {
-    perror("UDP socket creation failed");
-    return 1;
-  }
-
-  sockaddr_in udpAddr{};
-  udpAddr.sin_family = AF_INET;
-  udpAddr.sin_port = htons(vnPort);
-  udpAddr.sin_addr.s_addr = vnIP;
-  if (bind(udpSock, (sockaddr *)&udpAddr, sizeof(udpAddr)) < 0) {
-    perror("UDP bind failed");
-    close(udpSock);
-    return 1;
-  }
-
-  int tcpSock = socket(AF_INET, SOCK_STREAM, 0);
-  if (tcpSock < 0) {
-    perror("TCP socket creation failed");
-    close(udpSock);
-    return 1;
-  }
-
-  struct sockaddr_in on_addr{};
-  on_addr.sin_family = AF_INET;
-  on_addr.sin_port = htons(5000);
-  on_addr.sin_addr.s_addr = inet_addr(argv[1]);
-
-  if (connect(tcpSock, (struct sockaddr *)&on_addr, sizeof(on_addr)) < 0) {
-    perror("TCP connection to ON failed");
-    close(udpSock);
-    close(tcpSock);
-    return 1;
-  }
-
-  ConnectMsg cmsg = {vnIP, htons(vnPort)};
-  send(tcpSock, &cmsg, sizeof(cmsg), 0);
-
-  std::cout << "Connected to ON. Waiting for LS..." << std::endl;
-
-  char myNode = '\0';
-  uint32_t mySeq = 0;
-  std::vector<Neighbor> neighbors;
-  int graph[MAX_NODES][MAX_NODES];
-  bool knownNodes[MAX_NODES];
-  uint32_t maxSeq[MAX_NODES];
-
-  for (int i = 0; i < MAX_NODES; ++i) {
-    knownNodes[i] = false;
-    maxSeq[i] = 0;
-    for (int j = 0; j < MAX_NODES; ++j) {
-      graph[i][j] = (i == j ? 0 : -1);
+    if (argc != 4) {
+        cerr << "Usage: " << argv[0] << " <ON_IP_ADDRESS> <VN_IP_ADDRESS> <VN_UDP_PORT>\n";
+        return 1;
     }
-  }
 
-  time_t lastLSPBroadcast = time(NULL);
-  time_t lastGraphPrint = time(NULL);
+    uint32_t vn_ip = inet_addr(argv[2]);
+    uint16_t vn_port = (uint16_t)stoi(argv[3]);
 
-  while (true) {
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(tcpSock, &readfds);
-    FD_SET(udpSock, &readfds);
-    int maxfd = (tcpSock > udpSock ? tcpSock : udpSock);
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock < 0) {
+        perror("UDP socket creation failed");
+        return 1;
+    }
 
-    timeval tv{1, 0};
-    int sel = select(maxfd + 1, &readfds, NULL, NULL, &tv);
+    sockaddr_in udp_addr{};
+    udp_addr.sin_family = AF_INET;
+    udp_addr.sin_port = htons(vn_port);
+    udp_addr.sin_addr.s_addr = vn_ip;
+    if (bind(udp_sock, (sockaddr *)&udp_addr, sizeof(udp_addr)) < 0) {
+        perror("UDP bind failed");
+        close(udp_sock);
+        return 1;
+    }
 
-    if (sel > 0) {
-      if (FD_ISSET(tcpSock, &readfds)) {
-        char buf[2048];
-        int bytes = recv(tcpSock, buf, sizeof(buf), 0);
-        if (bytes <= 0) {
-          std::cout << "\nOracle Node disconnected." << std::endl;
-          break;
+    int tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (tcp_sock < 0) {
+        perror("TCP socket creation failed");
+        close(udp_sock);
+        return 1;
+    }
+
+    sockaddr_in on_addr{};
+    on_addr.sin_family = AF_INET;
+    on_addr.sin_port = htons(5000);
+    on_addr.sin_addr.s_addr = inet_addr(argv[1]);
+
+    if (connect(tcp_sock, (sockaddr *)&on_addr, sizeof(on_addr)) < 0) {
+        perror("TCP connection to ON failed");
+        close(udp_sock);
+        close(tcp_sock);
+        return 1;
+    }
+
+    ConnectMsg cmsg = {vn_ip, htons(vn_port)};
+    if (!send_all(tcp_sock, &cmsg, sizeof(cmsg))) {
+        cerr << "CONNECT message send failed\n";
+        close(udp_sock);
+        close(tcp_sock);
+        return 1;
+    }
+
+    cout << "Connected to ON. Waiting for LS..." << endl;
+
+    for (int i = 0; i < MAX_NODES; i++) {
+        known[i] = false;
+        max_seq[i] = 0;
+        for (int j = 0; j < MAX_NODES; j++) {
+            graph[i][j] = (i == j ? 0 : -1);
         }
+    }
 
-        neighbors.clear();
-        std::string print_out = "";
-        for (int i = 0; i < bytes / (int)sizeof(LSTuple); i++) {
-          LSTuple t = ((LSTuple *)buf)[i];
-          int cost = ntohl(t.cost);
+    time_t last_lsp = time(NULL);
+    time_t last_print = time(NULL);
 
-          if (cost == 0) {
-            myNode = t.node;
-            knownNodes[myNode - 'A'] = true;
-            print_out = std::string(1, t.node) + "=0, " + print_out;
-          } else {
-            neighbors.push_back({t.node, t.ip, ntohs(t.port), cost});
-            knownNodes[t.node - 'A'] = true;
-            graph[myNode - 'A'][t.node - 'A'] = cost;
-            graph[t.node - 'A'][myNode - 'A'] = cost;
-            print_out += std::string(1, t.node) + "=" + std::to_string(cost) + ", ";
-          }
-        }
+    while (true) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(tcp_sock, &read_fds);
+        FD_SET(udp_sock, &read_fds);
+        int max_fd = (tcp_sock > udp_sock ? tcp_sock : udp_sock);
 
-        if (print_out.length() > 2) print_out.erase(print_out.length() - 2);
-        std::cout << "Received " << print_out << std::endl;
+        timeval tv{1, 0};
+        int ready = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
 
-        if (myNode != '\0') {
-          mySeq++;
-          maxSeq[myNode - 'A'] = mySeq;
-          sendLSP(udpSock, myNode, mySeq, neighbors);
-          lastLSPBroadcast = time(NULL);
-        }
-      }
-
-      if (FD_ISSET(udpSock, &readfds)) {
-        uint8_t udpBuf[2048];
-        sockaddr_in fromAddr{};
-        socklen_t fromLen = sizeof(fromAddr);
-        int bytes = recvfrom(udpSock, udpBuf, sizeof(udpBuf), 0, (sockaddr *)&fromAddr, &fromLen);
-
-        if (bytes >= (int)sizeof(LSPHeader)) {
-          LSPHeader *hdr = (LSPHeader *)udpBuf;
-          char origin = hdr->origin;
-          uint32_t seq = ntohl(hdr->seq);
-          uint8_t num_links = hdr->num_links;
-
-          if (bytes >= (int)(sizeof(LSPHeader) + num_links * sizeof(LSPLink))) {
-            int origIdx = origin - 'A';
-            if (origin != myNode && origIdx >= 0 && origIdx < MAX_NODES) {
-              if (seq > maxSeq[origIdx]) {
-                maxSeq[origIdx] = seq;
-                knownNodes[origIdx] = true;
-
-                LSPLink *links = (LSPLink *)(udpBuf + sizeof(LSPHeader));
-                for (int i = 0; i < MAX_NODES; ++i) {
-                  if (i != origIdx) graph[origIdx][i] = -1;
-                }
-                for (int i = 0; i < num_links; ++i) {
-                  char nbrChar = links[i].neighbor;
-                  int nbrIdx = nbrChar - 'A';
-                  int cost = ntohl(links[i].cost);
-                  if (nbrIdx >= 0 && nbrIdx < MAX_NODES) {
-                    knownNodes[nbrIdx] = true;
-                    graph[origIdx][nbrIdx] = cost;
-                    graph[nbrIdx][origIdx] = cost;
-                  }
-                }
-
-                forwardLSP(udpSock, udpBuf, bytes, neighbors, fromAddr.sin_addr.s_addr, ntohs(fromAddr.sin_port));
-              }
+        if (ready > 0) {
+            if (FD_ISSET(tcp_sock, &read_fds)) {
+                if (!handle_link_state(tcp_sock, udp_sock)) break;
+                last_lsp = time(NULL);
             }
-          }
+            if (FD_ISSET(udp_sock, &read_fds)) {
+                handle_incoming_lsp(udp_sock);
+            }
         }
-      }
+
+        time_t now = time(NULL);
+        if (my_node != 0) {
+            if (now - last_lsp >= 15) {
+                last_lsp = now;
+                send_own_lsp(udp_sock);
+            }
+            if (now - last_print >= 10) {
+                last_print = now;
+                print_adj_list();
+            }
+        }
     }
 
-    time_t now = time(NULL);
-    if (myNode != '\0') {
-      if (now - lastLSPBroadcast >= 15) {
-        lastLSPBroadcast = now;
-        mySeq++;
-        maxSeq[myNode - 'A'] = mySeq;
-        sendLSP(udpSock, myNode, mySeq, neighbors);
-      }
-      if (now - lastGraphPrint >= 10) {
-        lastGraphPrint = now;
-        printGraph(myNode, graph, knownNodes);
-      }
-    }
-  }
-
-  close(tcpSock);
-  close(udpSock);
-  return 0;
+    close(tcp_sock);
+    close(udp_sock);
+    return 0;
 }

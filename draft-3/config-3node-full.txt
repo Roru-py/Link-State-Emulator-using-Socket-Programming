@@ -1,0 +1,6 @@
+# 3-node fully connected: A-B-C, all pairs linked
+# Costs from A to B, C
+10	20
+# Costs from B to C
+	15
+
